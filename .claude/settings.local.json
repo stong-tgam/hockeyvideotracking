@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python setup.py run --video samplevideo.mp4)"
+    ]
+  }
+}
