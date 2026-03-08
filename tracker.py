@@ -182,8 +182,9 @@ class HockeyTracker:
         self.puck_positions_history = deque(maxlen=10)
         self.last_known_puck_position = None
 
-        # Track initialization state
-        self.initialization_complete = False
+        # Track initialization state - this is no longer a single-pass initialization
+        # as team assignment happens continuously for new tracker IDs
+        self.initialization_complete = True  # Set to True initially since assignment happens every frame
         self.initialization_frame = None
 
         print(f"Hockey model detection: {self.is_hockey_model}")
@@ -226,82 +227,88 @@ class HockeyTracker:
                 else:
                     self.jersey_numbers[tracker_id] = str(tracker_id)
 
-    def assign_jersey_numbers(self, frame, detections):
+    def assign_jersey_numbers(self, frame, tracked_detections):
         """
         Assign jersey numbers based on model classes or detection patterns
-        Also classify teams based on jersey colors
+        Also classify teams based on jersey colors for new tracker IDs
         """
         if self.is_hockey_model:
             # Filter for hockey-specific classes that have jersey numbers
             # Typically players (not goaltenders/referees) wear numbered jerseys
-            player_mask = (detections.class_id == 4)  # Players class
-            player_detections = detections[player_mask]
+            # Loop through tracked_detections to process each detection
+            for i, (xyxy, tracker_id) in enumerate(zip(tracked_detections.xyxy, tracked_detections.tracker_id)):
+                # Check if this tracker_id is already assigned - only assign new ones
+                if tracker_id not in self.jersey_numbers or tracker_id not in self.player_teams:
+                    # Get class_id for this specific detection
+                    class_id = tracked_detections.class_id[i] if i < len(tracked_detections.class_id) else None
 
-            # For goaltenders and referees, we use special identifiers
-            goaltender_mask = (detections.class_id == 3)  # Goaltender class
-            referee_mask = (detections.class_id == 6)  # Referee class
+                    # Classify based on class_id
+                    if class_id == 4:  # Player class
+                        # Check if we need to assign jersey number for this new player
+                        if tracker_id not in self.jersey_numbers:
+                            # Assign jersey number based on existing numbers to avoid duplicates
+                            assigned_number = len([k for k, v in self.jersey_numbers.items() if not v.startswith(('G', 'R'))]) + 1
+                            self.jersey_numbers[tracker_id] = str(assigned_number)
 
-            goaltender_detections = detections[goaltender_mask]
-            referee_detections = detections[referee_mask]
+                        # Classify team based on jersey color only if not already classified
+                        if tracker_id not in self.player_teams:
+                            team_name, jersey_color = self.team_classifier.classify_team(
+                                frame, xyxy, tracker_id, self.player_teams, class_id=4  # 4 is player class
+                            )
+                            self.player_teams[tracker_id] = (team_name, jersey_color)
 
-            # Assign jersey numbers and classify teams for players
-            for i, tracker_id in enumerate(player_detections.tracker_id):
-                if tracker_id not in self.jersey_numbers:
-                    # Assign jersey number based on existing numbers to avoid duplicates
-                    assigned_number = len([k for k, v in self.jersey_numbers.items() if not v.startswith(('G', 'R'))]) + 1
-                    self.jersey_numbers[tracker_id] = str(assigned_number)
+                    elif class_id == 3:  # Goaltender class
+                        # Check if we need to assign identifier for this new goalie
+                        if tracker_id not in self.jersey_numbers:
+                            self.jersey_numbers[tracker_id] = "G"
 
-                # Classify team based on jersey color using class_id for better classification
-                if i < len(player_detections.xyxy):  # Safety check
-                    bbox = player_detections.xyxy[i]
-                    team_name, jersey_color = self.team_classifier.classify_team(
-                        frame, bbox, tracker_id, self.player_teams, class_id=4  # 4 is player class
-                    )
+                        # Classify team for goalie only if not already classified
+                        if tracker_id not in self.player_teams:
+                            team_name, jersey_color = self.team_classifier.classify_team(
+                                frame, xyxy, tracker_id, self.player_teams, class_id=3  # 3 is goalie class
+                            )
+                            self.player_teams[tracker_id] = (team_name, jersey_color)
 
-                    self.player_teams[tracker_id] = (team_name, jersey_color)
+                    elif class_id == 6:  # Referee class
+                        # Check if we need to assign identifier for this new referee
+                        if tracker_id not in self.jersey_numbers:
+                            self.jersey_numbers[tracker_id] = "REF"
 
-            # Assign special identifiers for goaltenders and classify as goalie team
-            for i, tracker_id in enumerate(goaltender_detections.tracker_id):
-                self.jersey_numbers[tracker_id] = "G"
+                        # Classify team for referee only if not already classified
+                        if tracker_id not in self.player_teams:
+                            team_name, jersey_color = self.team_classifier.classify_team(
+                                frame, xyxy, tracker_id, self.player_teams, class_id=6  # 6 is referee class
+                            )
+                            self.player_teams[tracker_id] = (team_name, jersey_color)
 
-                if i < len(goaltender_detections.xyxy):  # Safety check
-                    bbox = goaltender_detections.xyxy[i]
-                    # Use the classification function but specify it's a goalie
-                    team_name, jersey_color = self.team_classifier.classify_team(
-                        frame, bbox, tracker_id, self.player_teams, class_id=3  # 3 is goalie class
-                    )
-                    self.player_teams[tracker_id] = (team_name, jersey_color)
-
-            # Assign special identifiers for referees and classify as referee team
-            for i, tracker_id in enumerate(referee_detections.tracker_id):
-                self.jersey_numbers[tracker_id] = "REF"
-
-                if i < len(referee_detections.xyxy):  # Safety check
-                    bbox = referee_detections.xyxy[i]
-                    # Use the classification function but specify it's a referee
-                    team_name, jersey_color = self.team_classifier.classify_team(
-                        frame, bbox, tracker_id, self.player_teams, class_id=6  # 6 is referee class
-                    )
-                    self.player_teams[tracker_id] = (team_name, jersey_color)
         else:
-            # For general model, just assign sequential numbers to person detections
-            person_mask = (detections.class_id == 0)  # Person class in COCO
-            person_detections = detections[person_mask]
+            # For general model, process each tracked detection
+            for i, (xyxy, tracker_id) in enumerate(zip(tracked_detections.xyxy, tracked_detections.tracker_id)):
+                # Check if this tracker_id is already assigned - only assign new ones
+                if tracker_id not in self.jersey_numbers or tracker_id not in self.player_teams:
+                    # Check if we need to assign jersey number for this new person
+                    if tracker_id not in self.jersey_numbers:
+                        self.jersey_numbers[tracker_id] = str(len(self.jersey_numbers) + 1)
 
-            for i, tracker_id in enumerate(person_detections.tracker_id):
-                self.jersey_numbers[tracker_id] = str(i + 1)
+                    # Classify team for general person detection only if not already classified
+                    if tracker_id not in self.player_teams:
+                        team_name, jersey_color = self.team_classifier.classify_team(
+                            frame, xyxy, tracker_id, self.player_teams
+                        )
+                        self.player_teams[tracker_id] = (team_name, jersey_color)
 
-                # Classify team for general person detection (using bounding box position as heuristic initially)
-                bbox = person_detections.xyxy[i]
-                team_name, jersey_color = self.team_classifier.classify_team(
-                    frame, bbox, tracker_id, self.player_teams
-                )
-
-                self.player_teams[tracker_id] = (team_name, jersey_color)
-
-        print(f"Jersey numbers assigned: {dict(list(self.jersey_numbers.items())[:10])}")  # Show first 10
-        print(f"Team assignments: {dict(list(self.player_teams.items())[:10])}")  # Show first 10
-        self.initialization_complete = True
+        # Print occasional updates but not every frame
+        if hasattr(self, '_last_print_frame'):
+            if hasattr(self, 'frame_count'):
+                self.frame_count += 1
+                if self.frame_count % 30 == 0:  # Print every 30 frames
+                    print(f"Frame {self.frame_count}: Jersey numbers assigned: {dict(list(self.jersey_numbers.items())[:10])}")
+                    print(f"Team assignments: {dict(list(self.player_teams.items())[:10])}")
+        else:
+            self.frame_count = 0
+            print(f"Jersey numbers assigned: {dict(list(self.jersey_numbers.items())[:10])}")  # Show first 10
+            print(f"Team assignments: {dict(list(self.player_teams.items())[:10])}")  # Show first 10
+            self.initialization_complete = True  # Set initialization complete when first assignment happens
 
     def interpolate_puck_position(self, frame, detections, current_frame_idx):
         """
@@ -360,9 +367,8 @@ class HockeyTracker:
         # Apply tracking
         tracked_detections = self.tracker.update_with_detections(detections)
 
-        # Handle jersey number assignment and team classification on first frame
-        if not self.initialization_complete and frame_idx == 0:
-            self.assign_jersey_numbers(frame, detections)
+        # Handle jersey number assignment and team classification on every frame for new trackers
+        self.assign_jersey_numbers(frame, tracked_detections)
 
         # Get interpolated puck position
         puck_position = self.interpolate_puck_position(frame, detections, frame_idx)
