@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 import math
 import csv
 import os
+# Module refreshed with average_color functionality - March 8, 2026
 
 class HockeyAnalytics:
     def __init__(self, homography_calculator):
@@ -35,12 +36,25 @@ class HockeyAnalytics:
             print("No data to export to CSV.")
             return
 
+        print(f"Exporting {len(self.csv_data)} rows to CSV")
+        if self.csv_data:
+            print(f"First row keys: {list(self.csv_data[0].keys())}")
+
         with open(output_path, 'w', newline='') as csvfile:
-            fieldnames = ['frame', 'player_id', 'team', 'jersey_number', 'distance_moved_since_last_frame', 'total_distance', 'x_pos', 'y_pos']
+            fieldnames = ['frame', 'player_id', 'team', 'jersey_number', 'average_color', 'x_pos', 'y_pos', 'distance_moved_since_last_frame', 'total_distance', 'speed_fps']
+            print(f"DEBUG: Exporting with fieldnames: {fieldnames}")  # Debug statement
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
             writer.writeheader()
             for row in self.csv_data:
+                # Verify each row has the expected keys
+                missing_keys = set(fieldnames) - set(row.keys())
+                if missing_keys:
+                    print(f"Warning: Row missing keys: {missing_keys}")
+                    # Fill missing keys with default values
+                    for key in missing_keys:
+                        row[key] = 'N/A'
+
                 writer.writerow(row)
 
         print(f"CSV export completed: {output_path}")
@@ -61,7 +75,7 @@ class HockeyAnalytics:
 
         return distance
 
-    def update_player_distances(self, tracker, tracked_detections, frame, frame_idx):
+    def update_player_distances(self, tracker, tracked_detections, frame, frame_idx, fps=30):
         """
         Update total distance traveled by each player and collect CSV data
         """
@@ -83,7 +97,6 @@ class HockeyAnalytics:
                 self.position_history[tracker_id].append(current_rink_point)
 
                 # Update distance if we have a previous position
-                prev_pos_key = f'prev_pos_{tracker_id}'
                 prev_pos = self.prev_positions.get(tracker_id)
 
                 distance_traveled = 0
@@ -91,10 +104,21 @@ class HockeyAnalytics:
                     distance_traveled = self.calculate_real_world_distance(prev_pos, current_rink_point)
                     self.player_distances[tracker_id] += distance_traveled
 
+                # Calculate speed (feet per second)
+                speed_fps = distance_traveled * fps if fps > 0 else 0
+
                 # Get team and jersey number information
                 team_info = tracker.player_teams.get(tracker_id, ('unknown', 'unknown'))
                 team_name = team_info[0] if isinstance(team_info, tuple) else 'unknown'
                 jersey_number = tracker.jersey_numbers.get(tracker_id, tracker_id)
+
+                # Get average color for debugging purposes
+                avg_color = 'unknown'
+                if hasattr(tracker, 'team_classifier'):
+                    # Calculate average color from the player's bounding box for CSV export
+                    calculated_color = tracker.team_classifier.calculate_average_color(frame, xyxy)
+                    if calculated_color is not None:
+                        avg_color = f"({calculated_color[0]}, {calculated_color[1]}, {calculated_color[2]})"
 
                 # Record data for CSV export
                 csv_row = {
@@ -102,11 +126,14 @@ class HockeyAnalytics:
                     'player_id': tracker_id,
                     'team': team_name,
                     'jersey_number': jersey_number,
+                    'average_color': avg_color,
+                    'x_pos': current_rink_point[0],
+                    'y_pos': current_rink_point[1],
                     'distance_moved_since_last_frame': distance_traveled,
                     'total_distance': self.player_distances[tracker_id],
-                    'x_pos': current_rink_point[0],
-                    'y_pos': current_rink_point[1]
+                    'speed_fps': speed_fps
                 }
+                print(f"DEBUG: Added CSV row with keys: {list(csv_row.keys())}")  # Debug statement
                 self.csv_data.append(csv_row)
 
                 # Update previous position
@@ -115,39 +142,9 @@ class HockeyAnalytics:
     def calculate_puck_possession(self, player_positions, puck_position, frame_idx):
         """
         Determine which player has possession of the puck
-        player_positions: dict of {tracker_id: (x, y) in rink space}
-        puck_position: (x, y) in rink space
+        Currently disabled since puck tracking is unreliable
         """
-        if puck_position is None:
-            return None
-
-        closest_player_id = None
-        min_distance = float('inf')
-
-        # Find closest player to puck
-        for tracker_id, player_pos in player_positions.items():
-            distance = self.calculate_real_world_distance(player_pos, puck_position)
-
-            if distance < min_distance:
-                min_distance = distance
-                closest_player_id = tracker_id
-
-        # Check if this constitutes possession
-        if min_distance <= self.possession_threshold:
-            # Update possession history
-            if closest_player_id not in self.puck_control_history:
-                self.puck_control_history[closest_player_id] = {'frames': [], 'start_frame': frame_idx}
-
-            self.puck_control_history[closest_player_id]['frames'].append(frame_idx)
-
-            # Check if this is sustained possession
-            frames = self.puck_control_history[closest_player_id]['frames']
-            recent_frames = [f for f in frames if frame_idx - f < self.possession_min_frames]
-
-            if len(recent_frames) >= self.possession_min_frames:
-                return closest_player_id
-
-        return None
+        return None  # Disabled puck tracking
 
     def generate_kde_heatmap(self, tracker_id, sigma=15):
         """
@@ -303,10 +300,13 @@ class HockeyAnalytics:
         Process a single frame to update analytics
         """
         # Update player distances
-        self.update_player_distances(tracker, tracked_detections, frame, frame_idx)
+        # Get fps from the main process for speed calculation
+        # For now, using a default value - this would be passed from main
+        fps = 30  # Default value; in practice, would come from the video
+        self.update_player_distances(tracker, tracked_detections, frame, frame_idx, fps)
 
-        # Calculate puck possession
-        possessed_player_id = self.calculate_puck_possession(self.player_positions, puck_position, frame_idx)
+        # No puck possession calculation (disabled)
+        possessed_player_id = None
 
         # Draw rink visualization
         rink_vis = self.draw_rink_visualization(

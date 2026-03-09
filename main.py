@@ -18,6 +18,9 @@ def main(video_path, model_path, output_path=None):
     homography_calc = HockeyRinkHomography()
     analytics = HockeyAnalytics(homography_calc)
 
+    # Create visualization instance
+    visualization = HockeyVisualization()
+
     # Open video
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -85,13 +88,13 @@ def main(video_path, model_path, output_path=None):
         # Compute homography matrix for this frame
         homography_calc.compute_homography(tracked_detections)
 
-        # Process analytics
-        # For this implementation, we'll focus on tracking and team classification without detailed analytics
-        # We'll just return a placeholder rink visualization
-        possessed_player_id = None
+        # Process analytics - UPDATE: explicitly call the analytics update
+        # Get fps for speed calculation
+        actual_fps = fps if fps > 0 else 30
+        analytics.update_player_distances(tracker, tracked_detections, frame, frame_idx, actual_fps)
 
-        # Calculate puck possession
-        possessed_player_id = analytics.calculate_puck_possession(analytics.player_positions, puck_position, frame_idx)
+        # Calculate puck possession - now disabled
+        possessed_player_id = None
 
         # Create a placeholder for the analytics (since we're not showing rink view)
         rink_vis = np.zeros((100, 100, 3), dtype=np.uint8)  # Small placeholder

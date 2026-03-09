@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -c \"with open\\(''player_analytics.csv'', ''r''\\) as f: print\\(''Header:'', f.readline\\(\\).strip\\(\\)\\)\")",
+      "Bash(timeout 30s py demo.py --video samplevideo.mp4 --model models/basic_yolo.pt --output analyzed_samplevideo_with_avg_color_updated.mp4)",
+      "Bash(py demo.py --video samplevideo.mp4 --model models/basic_yolo.pt --output analyzed_samplevideo_debug_avg_color.mp4)",
+      "Bash(py -c \"with open\\(''player_analytics.csv'', ''r''\\) as f: print\\(''Header:'', f.readline\\(\\).strip\\(\\)\\); print\\(''First data line:'', f.readline\\(\\).strip\\(\\)\\)\")",
+      "Bash(dir /s *.pyc __pycache__)",
+      "Bash(py demo.py --video samplevideo.mp4 --model models/basic_yolo.pt --output analyzed_samplevideo_with_fresh_cache.mp4)",
+      "Bash(timeout 45s py -c \":*)",
+      "Bash(py -c \"import os; f=open\\(''player_analytics.csv'', ''r''\\); print\\(''HEADER:'', f.readline\\(\\).strip\\(\\)\\); f.close\\(\\); print\\(''Done''\\)\")",
+      "Bash(py demo.py --video samplevideo.mp4 --model models/basic_yolo.pt --output analyzed_samplevideo_corrected_color.mp4)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\tongd\\Documents\\Github\\videotracking",
+      "C:\\Users\\tongd\\Documents\\Github\\videotracking\\__pycache__",
+      "c:\\Users\\tongd\\Documents\\Github\\videotracking\\__pycache__"
+    ]
+  }
+}
