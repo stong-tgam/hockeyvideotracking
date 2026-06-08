@@ -178,9 +178,14 @@ class TeamClassifier:
 
         all_torso_pixels = []
 
-        # Collect jersey pixels from all frames and detections
+        # Collect jersey pixels from PLAYER detections only (class_id 4)
+        # Excludes refs, goalies, rink features which contaminate baselines
         for frame, detections in frames_and_detections:
-            for xyxy in detections.xyxy:
+            for i, xyxy in enumerate(detections.xyxy):
+                # Filter: only use player detections (class_id == 4) if class info available
+                if detections.class_id is not None and len(detections.class_id) > i:
+                    if detections.class_id[i] != 4:
+                        continue
                 pixels = self.extract_jersey_contour_pixels(frame, xyxy)
                 if pixels is not None and len(pixels) > 0:
                     # Randomly sample pixels if the contour is large to speed up KMeans
@@ -217,88 +222,54 @@ class TeamClassifier:
     def assign_player_to_team(self, frame, bbox):
         """
         Step 3: Frame-by-Frame Assignment
-        Uses contour-extracted pixels to find the dominant color, then compares via LAB distance.
+        Uses contour-extracted pixels to find the dominant color via median,
+        then compares to baselines using HSV distance (robust to lighting changes).
         """
-        from sklearn.cluster import KMeans
-
         # Step 1: Extract true jersey pixels using contour masking
         pixels = self.extract_jersey_contour_pixels(frame, bbox)
 
         if pixels is None or len(pixels) < 1:
             return "unknown", "unknown", (128, 128, 128)
 
+        # Step 2: Find dominant color using median (cheaper & more stable than KMeans k=1)
+        player_dominant_color = np.median(pixels, axis=0).astype(int)
+
         # If baselines aren't initialized yet, use adaptive approach
         if not self.kmeans_initialized:
-            # Add this color to potential team colors for later analysis
-            player_dominant_color = np.mean(pixels, axis=0).astype(int)
             self.potential_team_colors.append(player_dominant_color)
 
-            # If we have collected enough samples, try to establish baselines based on the extremes
-            if len(self.potential_team_colors) >= 10:  # Minimum sample size
-                # Find darkest and brightest among collected colors
+            if len(self.potential_team_colors) >= 10:
                 brightness_values = [np.mean(color) for color in self.potential_team_colors]
                 sorted_indices = np.argsort(brightness_values)
-
-                # Take the darkest as team_1 and brightest as team_2
                 darkest_idx = sorted_indices[0]
                 brightest_idx = sorted_indices[-1]
-
-                self.team_1_color = self.potential_team_colors[darkest_idx].astype(int)  # Darker team
-                self.team_2_color = self.potential_team_colors[brightest_idx].astype(int)  # Lighter team
+                self.team_1_color = self.potential_team_colors[darkest_idx].astype(int)
+                self.team_2_color = self.potential_team_colors[brightest_idx].astype(int)
                 self.kmeans_initialized = True
                 print(f"Adaptive baselines established: Team 1 {self.team_1_color}, Team 2 {self.team_2_color}")
 
-            # If we have initial baselines now, use them; otherwise use brightness heuristic
             if self.kmeans_initialized:
-                # Run K-Means with k=1 on the contour pixels to find dominant jersey color
-                if len(pixels) == 1:
-                    player_dominant_color = pixels[0].astype(int)
-                else:
-                    kmeans = KMeans(n_clusters=1, random_state=42, n_init=10)
-                    kmeans.fit(pixels)
-                    player_dominant_color = kmeans.cluster_centers_[0].astype(int)
-
-                # Calculate distances to known baselines
-                player_lab = self.rgb_to_lab(player_dominant_color)
-                team1_lab = self.rgb_to_lab(self.team_1_color if self.team_1_color is not None else [128, 128, 128])
-                team2_lab = self.rgb_to_lab(self.team_2_color if self.team_2_color is not None else [128, 128, 128])
-
-                dist_to_team1 = self.lab_color_distance(player_lab, team1_lab)
-                dist_to_team2 = self.lab_color_distance(player_lab, team2_lab)
+                # Compare using HSV distance
+                dist_to_team1 = self.hsv_color_distance(player_dominant_color, self.team_1_color if self.team_1_color is not None else np.array([128, 128, 128]))
+                dist_to_team2 = self.hsv_color_distance(player_dominant_color, self.team_2_color if self.team_2_color is not None else np.array([128, 128, 128]))
 
                 if dist_to_team1 <= dist_to_team2:
                     return "team_1", "jersey_color_1", tuple(player_dominant_color)
                 else:
-                    return "team_2", "t_2", tuple(player_dominant_color)
+                    return "team_2", "jersey_color_2", tuple(player_dominant_color)
             else:
-                # Use simple brightness heuristic when no baselines available
-                player_dominant_color = np.mean(pixels, axis=0).astype(int)
                 brightness = np.mean(player_dominant_color)
-                if brightness > 150:  # Likely white/light jersey
+                if brightness > 150:
                     return "team_2", "light_jersey", tuple(player_dominant_color)
-                elif brightness < 100:  # Likely black/dark jersey
+                elif brightness < 100:
                     return "team_1", "dark_jersey", tuple(player_dominant_color)
                 else:
                     return "unknown", "medium_jersey", tuple(player_dominant_color)
         else:
-            # Run K-Means with k=1 on the contour pixels to find dominant jersey color
-            if len(pixels) == 1:
-                player_dominant_color = pixels[0].astype(int)
-            else:
-                kmeans = KMeans(n_clusters=1, random_state=42, n_init=10)
-                kmeans.fit(pixels)
-                player_dominant_color = kmeans.cluster_centers_[0].astype(int)
+            # Compare using HSV distance (robust to lighting changes)
+            dist_to_team1 = self.hsv_color_distance(player_dominant_color, self.team_1_color if self.team_1_color is not None else np.array([128, 128, 128]))
+            dist_to_team2 = self.hsv_color_distance(player_dominant_color, self.team_2_color if self.team_2_color is not None else np.array([128, 128, 128]))
 
-            # Convert colors from BGR/RGB to LAB color space
-            player_lab = self.rgb_to_lab(player_dominant_color)
-            team1_lab = self.rgb_to_lab(self.team_1_color if self.team_1_color is not None else [128, 128, 128])
-            team2_lab = self.rgb_to_lab(self.team_2_color if self.team_2_color is not None else [128, 128, 128])
-
-            # Calculate the color distance using LAB values
-            dist_to_team1 = self.lab_color_distance(player_lab, team1_lab)
-            dist_to_team2 = self.lab_color_distance(player_lab, team2_lab)
-
-            # Return the assigned team (shortest distance)
             if dist_to_team1 <= dist_to_team2:
                 return "team_1", "jersey_color_1", tuple(player_dominant_color)
             else:
@@ -336,13 +307,12 @@ class TeamClassifier:
         avg_color = np.mean(player_region, axis=(0, 1))
         return tuple(avg_color.astype(int))
 
-    def rgb_to_lab(self, rgb):
+    def bgr_to_lab(self, bgr):
         """
-        Convert RGB color to LAB color space
+        Convert BGR color (OpenCV native format) to LAB color space
         """
-        # Convert RGB to BGR (OpenCV format)
-        bgr = np.uint8([[list(reversed(rgb))]])  # Reverse RGB to BGR
-        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        bgr_arr = np.uint8([[list(bgr)]])
+        lab = cv2.cvtColor(bgr_arr, cv2.COLOR_BGR2LAB)
         return tuple(lab[0, 0])
 
     def lab_color_distance(self, lab1, lab2):
@@ -354,24 +324,38 @@ class TeamClassifier:
         db = lab1[2] - lab2[2]
         return math.sqrt(dL*dL + da*da + db*db)
 
-    def rgb_to_hsv(self, rgb):
+    def bgr_to_hsv(self, bgr):
         """
-        Convert RGB color to HSV for better color comparison
+        Convert BGR color (OpenCV native format) to HSV
         """
-        # Convert single RGB value to HSV
-        rgb_normalized = np.array([[[rgb[0], rgb[1], rgb[2]]]], dtype=np.uint8)
-        hsv = cv2.cvtColor(rgb_normalized, cv2.COLOR_RGB2HSV)
+        bgr_arr = np.uint8([[list(bgr)]])
+        hsv = cv2.cvtColor(bgr_arr, cv2.COLOR_BGR2HSV)
         return tuple(hsv[0, 0])
+
+    def hsv_color_distance(self, bgr1, bgr2):
+        """
+        Compare two BGR colors via HSV distance.
+        Hue is weighted heavily but ignored when saturation is very low
+        (black/white jerseys), in which case brightness (value) decides.
+        """
+        h1, s1, v1 = self.bgr_to_hsv(bgr1)
+        h2, s2, v2 = self.bgr_to_hsv(bgr2)
+
+        # Circular hue distance (OpenCV hue range 0-180)
+        hue_diff = min(abs(int(h1) - int(h2)), 180 - abs(int(h1) - int(h2)))
+
+        # If both colors have very low saturation, hue is meaningless
+        # Use brightness (value) to distinguish black vs white
+        if s1 < 40 and s2 < 40:
+            return abs(int(v1) - int(v2))
+
+        return hue_diff * 2.0 + abs(int(s1) - int(s2)) * 0.5 + abs(int(v1) - int(v2)) * 0.3
 
     def color_distance(self, color1, color2):
         """
-        Calculate distance between two colors in HSV space
+        Calculate distance between two BGR colors in HSV space (legacy wrapper)
         """
-        h1, s1, v1 = self.rgb_to_hsv(color1)
-        h2, s2, v2 = self.rgb_to_hsv(color2)
-
-        # Weight hue more heavily as it's the most important for color distinction
-        return abs(h1 - h2) * 0.6 + abs(s1 - s2) * 0.3 + abs(v1 - v2) * 0.1
+        return self.hsv_color_distance(color1, color2)
 
     def classify_player_by_color(self, frame, bbox, tracker_id):
         """
@@ -476,8 +460,8 @@ class HockeyTracker:
         # Check if the model has the expected hockey classes
         self.is_hockey_model = self._check_if_hockey_model()
 
-        # Use ByteTrack for tracking - using default parameters to avoid compatibility issues
-        self.tracker = sv.ByteTrack()
+        # Use ByteTrack for tracking - increase lost_track_buffer so tracks survive brief occlusions
+        self.tracker = sv.ByteTrack(lost_track_buffer=60)
 
         # Store jersey numbers for players (to be detected automatically)
         self.jersey_numbers = {}
@@ -489,6 +473,12 @@ class HockeyTracker:
         # Store previous frame team color data for voting system
         self.team_color_buffer = {}  # {tracker_id: [(color1, frame_idx1), (color2, frame_idx2), ...]}
         self.analyzed_trackers = set()  # Trackers that have completed initial analysis
+
+        # Team validation: periodic re-check to correct wrong initial assignments
+        # Requires strong evidence (>80% disagreement) to flip — prevents lighting-induced flickering
+        self.team_validation_buffer = {}  # {tracker_id: deque of team votes}
+        self.TEAM_VALIDATION_WINDOW = 30  # Number of validation samples before considering a flip
+        self.TEAM_FLIP_THRESHOLD = 0.8    # Fraction of disagreeing votes needed to flip team
 
         # Initialize frame counter
         self.frame_count = 0
@@ -504,9 +494,9 @@ class HockeyTracker:
 
         # Re-ID support: store recently lost trackers {tracker_id: {'last_pos': (x,y), 'last_color': (r,g,b), 'timestamp': frame_idx}}
         self.lost_trackers = {}
-        self.REID_PROXIMITY_THRESHOLD = 50  # Pixels
-        self.REID_COLOR_THRESHOLD = 30      # HSV distance
-        self.REID_MAX_AGE = 30              # Frames
+        self.REID_PROXIMITY_THRESHOLD = 150  # Pixels (increased to catch fast-moving players)
+        self.REID_COLOR_THRESHOLD = 40       # LAB color distance threshold for appearance matching
+        self.REID_MAX_AGE = 90               # Frames (increased to handle longer occlusions)
 
         # For puck interpolation - disabling for now
         self.puck_positions_history = deque(maxlen=10)
@@ -631,46 +621,61 @@ class HockeyTracker:
 
                 # Check team assignment for players (not referees/goalies for team classification)
                 if class_id == 4:  # Only for players
-                    # Check if this tracker_id needs team analysis
                     if tracker_id not in self.player_teams:
-                        # Initialize color buffer for this tracker
+                        # Use vote-based assignment: classify each frame, assign by majority
                         if tracker_id not in self.team_color_buffer:
                             self.team_color_buffer[tracker_id] = []
 
-                        # Get the color for this frame
-                        avg_color = self.team_classifier.calculate_average_color(frame, xyxy)
+                        if self.baseline_collection_complete and self.team_classifier.kmeans_initialized:
+                            # Baselines ready: use robust contour + LAB assignment
+                            team_name, role, avg_color = self.team_classifier.assign_player_to_team(frame, xyxy)
+                            if team_name in ('team_1', 'team_2'):
+                                self.team_color_buffer[tracker_id].append((team_name, avg_color))
 
-                        if avg_color is not None:
-                            # Add color to buffer
-                            self.team_color_buffer[tracker_id].append((avg_color, self.frame_count))
-
-                            # If we have enough frames for analysis, determine final team assignment
-                            if len(self.team_color_buffer[tracker_id]) >= TEAM_ANALYSIS_FRAMES:
-                                # Calculate median color from buffer
-                                r_values = [c[0][0] for c in self.team_color_buffer[tracker_id]]
-                                g_values = [c[0][1] for c in self.team_color_buffer[tracker_id]]
-                                b_values = [c[0][2] for c in self.team_color_buffer[tracker_id]]
-
-                                median_r = sorted(r_values)[len(r_values)//2]
-                                median_g = sorted(g_values)[len(g_values)//2]
-                                median_b = sorted(b_values)[len(b_values)//2]
-
-                                median_color = (median_r, median_g, median_b)
-
-                                # Use the median color for team classification
-                                team_name, jersey_color = self.team_classifier.classify_team(
-                                    frame, xyxy, tracker_id, self.player_teams, class_id=4  # 4 is player class
-                                )
-
-                                # Update team classifier with the median color for this tracker
-                                self.player_teams[tracker_id] = (team_name, jersey_color)
+                            # Assign after 5 votes via majority
+                            votes = self.team_color_buffer.get(tracker_id, [])
+                            if len(votes) >= 5:
+                                team_votes = [v[0] for v in votes]
+                                t1_count = team_votes.count('team_1')
+                                t2_count = team_votes.count('team_2')
+                                winner = 'team_1' if t1_count >= t2_count else 'team_2'
+                                last_color = votes[-1][1] if votes[-1][1] else (128, 128, 128)
+                                self.player_teams[tracker_id] = (winner, last_color)
                                 self.analyzed_trackers.add(tracker_id)
-
-                                # Clear the buffer since analysis is complete
-                                del self.team_color_buffer[tracker_id]
+                                if tracker_id in self.team_color_buffer:
+                                    del self.team_color_buffer[tracker_id]
+                        else:
+                            # Baselines not ready: buffer raw colors and classify at end
+                            avg_color = self.team_classifier.calculate_average_color(frame, xyxy)
+                            if avg_color is not None:
+                                self.team_color_buffer[tracker_id].append(avg_color)
+                                if len(self.team_color_buffer[tracker_id]) >= TEAM_ANALYSIS_FRAMES:
+                                    team_name, jersey_color = self.team_classifier.classify_team(
+                                        frame, xyxy, tracker_id, self.player_teams, class_id=4
+                                    )
+                                    self.player_teams[tracker_id] = (team_name, jersey_color)
+                                    self.analyzed_trackers.add(tracker_id)
+                                    del self.team_color_buffer[tracker_id]
                     else:
-                        # For trackers already analyzed, don't reclassify
-                        pass
+                        # Already assigned: periodic re-validation (every 5 frames)
+                        if self.frame_count % 5 == 0 and self.team_classifier.kmeans_initialized:
+                            if tracker_id not in self.team_validation_buffer:
+                                self.team_validation_buffer[tracker_id] = deque(maxlen=self.TEAM_VALIDATION_WINDOW)
+
+                            team_name, role, avg_color = self.team_classifier.assign_player_to_team(frame, xyxy)
+                            if team_name in ('team_1', 'team_2'):
+                                self.team_validation_buffer[tracker_id].append(team_name)
+
+                            # Only flip if strong evidence of wrong assignment
+                            buf = self.team_validation_buffer.get(tracker_id)
+                            if buf and len(buf) >= self.TEAM_VALIDATION_WINDOW:
+                                current_team = self.player_teams[tracker_id][0]
+                                if current_team in ('team_1', 'team_2'):
+                                    disagree_count = sum(1 for v in buf if v != current_team)
+                                    if disagree_count / len(buf) >= self.TEAM_FLIP_THRESHOLD:
+                                        other_team = 'team_2' if current_team == 'team_1' else 'team_1'
+                                        self.player_teams[tracker_id] = (other_team, self.player_teams[tracker_id][1])
+                                        buf.clear()
 
                 elif class_id in [3, 6]:  # Goaltender or referee
                     # For goalies and referees, assign to special teams immediately
@@ -694,41 +699,57 @@ class HockeyTracker:
 
                 # Classify team for general person detection
                 if tracker_id not in self.player_teams:
-                    # Initialize color buffer for this tracker
                     if tracker_id not in self.team_color_buffer:
                         self.team_color_buffer[tracker_id] = []
 
-                    # Get the color for this frame
-                    avg_color = self.team_classifier.calculate_average_color(frame, xyxy)
+                    if self.baseline_collection_complete and self.team_classifier.kmeans_initialized:
+                        # Baselines ready: vote-based assignment
+                        team_name, role, avg_color = self.team_classifier.assign_player_to_team(frame, xyxy)
+                        if team_name in ('team_1', 'team_2'):
+                            self.team_color_buffer[tracker_id].append((team_name, avg_color))
 
-                    if avg_color is not None:
-                        # Add color to buffer
-                        self.team_color_buffer[tracker_id].append((avg_color, self.frame_count))
-
-                        # If we have enough frames for analysis, determine final team assignment
-                        if len(self.team_color_buffer[tracker_id]) >= TEAM_ANALYSIS_FRAMES:
-                            # Calculate median color from buffer
-                            r_values = [c[0][0] for c in self.team_color_buffer[tracker_id]]
-                            g_values = [c[0][1] for c in self.team_color_buffer[tracker_id]]
-                            b_values = [c[0][2] for c in self.team_color_buffer[tracker_id]]
-
-                            median_r = sorted(r_values)[len(r_values)//2]
-                            median_g = sorted(g_values)[len(g_values)//2]
-                            median_b = sorted(b_values)[len(b_values)//2]
-
-                            median_color = (median_r, median_g, median_b)
-
-                            # Use the median color for team classification
-                            team_name, jersey_color = self.team_classifier.classify_team(
-                                frame, xyxy, tracker_id, self.player_teams
-                            )
-
-                            # Update team classifier with the median color for this tracker
-                            self.player_teams[tracker_id] = (team_name, jersey_color)
+                        votes = self.team_color_buffer.get(tracker_id, [])
+                        if len(votes) >= 5:
+                            team_votes = [v[0] for v in votes]
+                            t1_count = team_votes.count('team_1')
+                            t2_count = team_votes.count('team_2')
+                            winner = 'team_1' if t1_count >= t2_count else 'team_2'
+                            last_color = votes[-1][1] if votes[-1][1] else (128, 128, 128)
+                            self.player_teams[tracker_id] = (winner, last_color)
                             self.analyzed_trackers.add(tracker_id)
+                            if tracker_id in self.team_color_buffer:
+                                del self.team_color_buffer[tracker_id]
+                    else:
+                        # Baselines not ready: buffer raw colors and classify at end
+                        avg_color = self.team_classifier.calculate_average_color(frame, xyxy)
+                        if avg_color is not None:
+                            self.team_color_buffer[tracker_id].append(avg_color)
+                            if len(self.team_color_buffer[tracker_id]) >= TEAM_ANALYSIS_FRAMES:
+                                team_name, jersey_color = self.team_classifier.classify_team(
+                                    frame, xyxy, tracker_id, self.player_teams
+                                )
+                                self.player_teams[tracker_id] = (team_name, jersey_color)
+                                self.analyzed_trackers.add(tracker_id)
+                                del self.team_color_buffer[tracker_id]
+                else:
+                    # Already assigned: periodic re-validation
+                    if self.frame_count % 5 == 0 and self.team_classifier.kmeans_initialized:
+                        if tracker_id not in self.team_validation_buffer:
+                            self.team_validation_buffer[tracker_id] = deque(maxlen=self.TEAM_VALIDATION_WINDOW)
 
-                            # Clear the buffer since analysis is complete
-                            del self.team_color_buffer[tracker_id]
+                        team_name, role, avg_color = self.team_classifier.assign_player_to_team(frame, xyxy)
+                        if team_name in ('team_1', 'team_2'):
+                            self.team_validation_buffer[tracker_id].append(team_name)
+
+                        buf = self.team_validation_buffer.get(tracker_id)
+                        if buf and len(buf) >= self.TEAM_VALIDATION_WINDOW:
+                            current_team = self.player_teams[tracker_id][0]
+                            if current_team in ('team_1', 'team_2'):
+                                disagree_count = sum(1 for v in buf if v != current_team)
+                                if disagree_count / len(buf) >= self.TEAM_FLIP_THRESHOLD:
+                                    other_team = 'team_2' if current_team == 'team_1' else 'team_1'
+                                    self.player_teams[tracker_id] = (other_team, self.player_teams[tracker_id][1])
+                                    buf.clear()
 
         # Print occasional updates but not every frame
         if hasattr(self, '_last_print_frame'):
@@ -764,7 +785,7 @@ class HockeyTracker:
         # Apply tracking
         tracked_detections = self.tracker.update_with_detections(detections)
 
-        # RE-ID: Detect lost trackers and add to lost_trackers
+        # RE-ID: Detect lost trackers and add to lost_trackers (with appearance info)
         current_trackers = set(tracked_detections.tracker_id)
         all_known_trackers = set(self.player_trajectories.keys()) | set(self.lost_trackers.keys())
         newly_lost = all_known_trackers - current_trackers - set(self.jersey_numbers.keys())
@@ -772,8 +793,16 @@ class HockeyTracker:
         for lost_id in newly_lost:
             if lost_id in self.player_trajectories and len(self.player_trajectories[lost_id]) > 0:
                 last_pos = self.player_trajectories[lost_id][-1]
+                # Store appearance (jersey color) for color-aware re-ID
+                last_color = None
+                team_info = self.player_teams.get(lost_id)
+                if team_info and isinstance(team_info, tuple) and len(team_info) >= 2:
+                    jersey_color = team_info[1]
+                    if isinstance(jersey_color, tuple) and len(jersey_color) == 3:
+                        last_color = jersey_color
                 self.lost_trackers[lost_id] = {
                     'last_pos': last_pos,
+                    'last_color': last_color,
                     'timestamp': self.frame_count
                 }
 
@@ -789,13 +818,46 @@ class HockeyTracker:
         for i, (xyxy, tracker_id) in enumerate(zip(tracked_detections.xyxy, tracked_detections.tracker_id)):
             center_point = (int((xyxy[0] + xyxy[2]) / 2), int((xyxy[1] + xyxy[3]) / 2))
             if tracker_id not in self.player_trajectories or len(self.player_trajectories[tracker_id]) == 0:
+                best_match_id = None
+                best_match_score = float('inf')
+
                 for lost_id, data in list(self.lost_trackers.items()):
                     last_pos = data['last_pos']
                     dist = math.sqrt((center_point[0] - last_pos[0])**2 + (center_point[1] - last_pos[1])**2)
-                    if dist < self.REID_PROXIMITY_THRESHOLD:
-                        self.player_trajectories[tracker_id] = deque(self.player_trajectories[lost_id], maxlen=30)
-                        del self.lost_trackers[lost_id]
-                        break
+                    if dist >= self.REID_PROXIMITY_THRESHOLD:
+                        continue
+
+                    # If lost tracker has color info, also check appearance similarity
+                    color_score = 0
+                    lost_color = data.get('last_color')
+                    if lost_color is not None:
+                        new_color = self.team_classifier.calculate_average_color(frame, xyxy)
+                        if new_color is not None:
+                            lost_lab = self.team_classifier.bgr_to_lab(lost_color)
+                            new_lab = self.team_classifier.bgr_to_lab(new_color)
+                            color_score = self.team_classifier.lab_color_distance(lost_lab, new_lab)
+                            if color_score > self.REID_COLOR_THRESHOLD:
+                                continue  # Colors too different, skip this candidate
+
+                    # Combined score: spatial distance + color distance
+                    combined_score = dist + color_score
+                    if combined_score < best_match_score:
+                        best_match_score = combined_score
+                        best_match_id = lost_id
+
+                if best_match_id is not None:
+                    # Transfer full state from lost tracker to new tracker
+                    self.player_trajectories[tracker_id] = deque(self.player_trajectories.get(best_match_id, deque(maxlen=30)), maxlen=30)
+                    if best_match_id in self.jersey_numbers:
+                        self.jersey_numbers[tracker_id] = self.jersey_numbers[best_match_id]
+                    if best_match_id in self.player_teams:
+                        self.player_teams[tracker_id] = self.player_teams[best_match_id]
+                    if best_match_id in self.team_color_buffer:
+                        self.team_color_buffer[tracker_id] = self.team_color_buffer[best_match_id]
+                        del self.team_color_buffer[best_match_id]
+                    if best_match_id in self.analyzed_trackers:
+                        self.analyzed_trackers.add(tracker_id)
+                    del self.lost_trackers[best_match_id]
 
             # Store trajectory for tracked objects (players, goaltenders, refs)
             if self.is_hockey_model:
