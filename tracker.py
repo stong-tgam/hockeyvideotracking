@@ -24,11 +24,13 @@ class TeamClassifier:
         self.team_2_color = None  # Baseline team 2 color (from k-means clustering)
         self.kmeans_initialized = False  # Whether baseline team colors have been established
 
-    def extract_torso_pixels(self, frame, bbox):
+        # Variables for adaptive learning when baselines are not established
+        self.potential_team_colors = []
+
+    def extract_jersey_pixels(self, frame, bbox):
         """
-        Step 1: Extract torso pixels from player bounding box
-        Crop the image to isolate only the upper middle half (the torso)
-        This is to avoid the ice, legs, skates, and sticks.
+        Extract pixels from the jersey area with improved black/white jersey detection
+        Focus specifically on detecting truly black (0-50) and truly white (200-255) jersey colors
         """
         x1, y1, x2, y2 = map(int, bbox)
 
@@ -44,33 +46,147 @@ class TeamClassifier:
         # Crop the player region
         player_region = frame[y1:y2, x1:x2]
 
-        # Focus on the upper middle half (torso region) - this is the "upper middle half" (chest/jersey area)
+        # Focus on the middle horizontal stripe of the player (chest/jersey area)
         h_start = int(player_region.shape[0] * 0.25)  # Start at 25% height
-        h_end = int(player_region.shape[0] * 0.75)    # End at 75% height
+        h_end = int(player_region.shape[0] * 0.70)    # End at 70% height
 
         if h_start < h_end:
-            torso_region = player_region[h_start:h_end, :]
-            # Reshape to list of pixels for k-means clustering
-            pixels = torso_region.reshape(-1, 3)  # Reshape to (N, 3) where N is number of pixels
+            jersey_area = player_region[h_start:h_end, :]
+
+            # Convert to grayscale to measure brightness
+            gray = cv2.cvtColor(jersey_area, cv2.COLOR_BGR2GRAY)
+
+            # Identify regions that are likely to be black or white jerseys
+            # Black jerseys: very dark regions (values 0-70)
+            # White jerseys: very bright regions (values 180-255)
+            # But be more inclusive to ensure we capture some pixels
+
+            # Create masks for different brightness ranges
+            black_mask = (gray >= 0) & (gray <= 80)  # Black jerseys (more inclusive)
+            white_mask = (gray >= 170) & (gray <= 255)  # White jerseys (more inclusive)
+
+            # Combine the masks to get pixels that are likely jersey colors
+            jersey_mask = black_mask | white_mask
+
+            # Get the pixels that match our jersey criteria
+            jersey_pixels = jersey_area[jersey_mask]
+
+            if len(jersey_pixels) > 0:
+                return jersey_pixels.astype(np.float32)
+
+            # If we still don't find enough distinctive pixels, return all pixels in the jersey area
+            # but with a more relaxed approach
+            pixels = jersey_area.reshape(-1, 3)
+
+            if len(pixels) > 0:
+                # Prioritize pixels that have some contrast to distinguish from ice
+                pixel_brightness = np.mean(pixels, axis=1)
+
+                # Be more inclusive - exclude only the extremes (likely ice or shadows)
+                jersey_brightness_mask = (pixel_brightness >= 10) & (pixel_brightness <= 245)
+                filtered_pixels = pixels[jersey_brightness_mask]
+
+                if len(filtered_pixels) > 0:
+                    return filtered_pixels.astype(np.float32)
+                else:
+                    # Last resort: return all pixels if none meet the criteria
+                    return pixels.astype(np.float32)
+
+        # Final fallback: return all pixels in the original area if shape constraints prevented extraction
+        jersey_area_full = player_region[int(player_region.shape[0] * 0.25):int(player_region.shape[0] * 0.70), :]
+        if jersey_area_full.size > 0:
+            pixels = jersey_area_full.reshape(-1, 3)
             return pixels.astype(np.float32)
 
         return None
 
+    def extract_jersey_contour_pixels(self, frame, bbox):
+        """
+        Step 1: Extract jersey pixels using contour detection.
+        Isolates the player from the ice background using Otsu's thresholding,
+        finds the player contour, and extracts the torso region.
+        """
+        x1, y1, x2, y2 = map(int, bbox)
+
+        # Ensure coordinates are within frame bounds
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame.shape[1], x2)
+        y2 = min(frame.shape[0], y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        # Crop the player region
+        player_crop = frame[y1:y2, x1:x2]
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(player_crop, cv2.COLOR_BGR2GRAY)
+
+        # Apply Otsu's thresholding to separate the player from the bright ice
+        # THRESH_BINARY_INV makes the darker player white (255) and the bright ice black (0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # Find contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            # Fallback if no contours found: take a simple center crop
+            h, w = player_crop.shape[:2]
+            fallback_crop = player_crop[int(h*0.2):int(h*0.6), int(w*0.2):int(w*0.8)]
+            return fallback_crop.reshape(-1, 3).astype(np.float32)
+
+        # Get the largest contour by area (this should be the player)
+        largest_contour = max(contours, key=cv2.contourArea)
+
+        # Get bounding rectangle of the contour itself
+        cx, cy, cw, ch = cv2.boundingRect(largest_contour)
+
+        # Define the jersey region vertically (e.g., top 20% to 60% of the player contour)
+        # This avoids the helmet (top 0-20%) and pants/skates (bottom 60-100%)
+        jersey_top = cy + int(ch * 0.2)
+        jersey_bottom = cy + int(ch * 0.6)
+
+        # Create a mask for the player's contour shape
+        contour_mask = np.zeros(player_crop.shape[:2], dtype=np.uint8)
+        cv2.drawContours(contour_mask, [largest_contour], -1, 255, -1)
+
+        # Create a mask for just the torso height
+        torso_height_mask = np.zeros(player_crop.shape[:2], dtype=np.uint8)
+        torso_height_mask[jersey_top:jersey_bottom, cx:cx+cw] = 255
+
+        # Combine masks: Must be inside the player's contour AND inside the torso height
+        final_mask = cv2.bitwise_and(contour_mask, torso_height_mask)
+
+        # Extract the original RGB pixels using the combined mask
+        pixels = player_crop[final_mask == 255]
+
+        if len(pixels) == 0:
+            # Fallback if the mask ended up empty
+            h, w = player_crop.shape[:2]
+            fallback_crop = player_crop[int(h*0.2):int(h*0.6), int(w*0.2):int(w*0.8)]
+            return fallback_crop.reshape(-1, 3).astype(np.float32)
+
+        return pixels.astype(np.float32)
+
     def initialize_team_baseline_colors(self, frames_and_detections):
         """
         Step 2: Find Team Baselines using K-Means Clustering
-        Take all extracted torso pixels and use K-Means clustering with k=2 to find the two dominant cluster centers.
-        Store these two cluster centers as team_1_color and team_2_color.
+        Uses the new contour-extracted pixels. Filters removed to allow pure black/white.
         """
         from sklearn.cluster import KMeans
 
         all_torso_pixels = []
 
-        # Collect torso pixels from all frames and detections
+        # Collect jersey pixels from all frames and detections
         for frame, detections in frames_and_detections:
             for xyxy in detections.xyxy:
-                pixels = self.extract_torso_pixels(frame, xyxy)
-                if pixels is not None:
+                pixels = self.extract_jersey_contour_pixels(frame, xyxy)
+                if pixels is not None and len(pixels) > 0:
+                    # Randomly sample pixels if the contour is large to speed up KMeans
+                    if len(pixels) > 150:
+                        indices = np.random.choice(len(pixels), 150, replace=False)
+                        pixels = pixels[indices]
                     all_torso_pixels.append(pixels)
 
         if len(all_torso_pixels) == 0:
@@ -79,28 +195,13 @@ class TeamClassifier:
         # Concatenate all pixels from all detections
         all_pixels = np.vstack(all_torso_pixels)
 
-        # Apply color filtering to distinguish jersey colors from background
-        all_pixels_uint8 = all_pixels.astype(np.uint8)
-
-        # Filter to keep likely jersey colors
-        not_too_bright = ~np.all(all_pixels_uint8 >= [245, 245, 245], axis=1)  # Filter out very bright (likely ice reflections)
-        not_too_dark = ~np.all(all_pixels_uint8 <= [30, 30, 30], axis=1)       # Filter out very dark (likely helmets/shadows)
-
-        # Calculate brightness to filter out background
-        brightness = np.mean(all_pixels_uint8, axis=1)
-        reasonable_brightness = (brightness > 50) & (brightness < 230)
-
-        # Combine filters
-        valid_pixels_mask = not_too_dark & not_too_bright & reasonable_brightness
-        filtered_pixels = all_pixels[valid_pixels_mask]
-
-        if len(filtered_pixels) < 2:
+        if len(all_pixels) < 2:
             return False
 
         # Apply K-means clustering with k=2 to find team baseline colors
-        n_clusters = min(2, len(filtered_pixels))  # Ensure we don't have more clusters than pixels
+        n_clusters = min(2, len(all_pixels))
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        kmeans.fit(filtered_pixels)
+        kmeans.fit(all_pixels)
 
         # Store the two cluster centers as team baseline colors
         cluster_centers = kmeans.cluster_centers_
@@ -116,70 +217,92 @@ class TeamClassifier:
     def assign_player_to_team(self, frame, bbox):
         """
         Step 3: Frame-by-Frame Assignment
-        Crop bounding box to torso region, apply color masks, run k=1 clustering,
-        convert to LAB color space, calculate color distances, return assigned team.
+        Uses contour-extracted pixels to find the dominant color, then compares via LAB distance.
         """
         from sklearn.cluster import KMeans
 
+        # Step 1: Extract true jersey pixels using contour masking
+        pixels = self.extract_jersey_contour_pixels(frame, bbox)
+
+        if pixels is None or len(pixels) < 1:
+            return "unknown", "unknown", (128, 128, 128)
+
+        # If baselines aren't initialized yet, use adaptive approach
         if not self.kmeans_initialized:
-            # If baselines aren't set yet, return unknown
-            return "unknown", "unknown", (128, 128, 128)
+            # Add this color to potential team colors for later analysis
+            player_dominant_color = np.mean(pixels, axis=0).astype(int)
+            self.potential_team_colors.append(player_dominant_color)
 
-        # Step 1: Crop bounding box to torso region
-        pixels = self.extract_torso_pixels(frame, bbox)
-        if pixels is None:
-            return "unknown", "unknown", (128, 128, 128)
+            # If we have collected enough samples, try to establish baselines based on the extremes
+            if len(self.potential_team_colors) >= 10:  # Minimum sample size
+                # Find darkest and brightest among collected colors
+                brightness_values = [np.mean(color) for color in self.potential_team_colors]
+                sorted_indices = np.argsort(brightness_values)
 
-        # Step 2: Apply color mask to filter out pure white (ice/edge cases) and pure black/dark gray (helmets, shadows, gloves)
-        # Convert pixels to uint8 for comparison
-        pixels_uint8 = pixels.astype(np.uint8)
+                # Take the darkest as team_1 and brightest as team_2
+                darkest_idx = sorted_indices[0]
+                brightest_idx = sorted_indices[-1]
 
-        # Create mask for acceptable jersey colors
-        # For white jerseys: values 180-255 in all channels should be kept
-        # For black jerseys: values 0-70 in all channels should be kept
-        # Filter out extreme values that are likely ice (very bright) or helmets (very dark)
-        not_too_bright = ~np.all(pixels_uint8 >= [245, 245, 245], axis=1)  # Filter out very bright (likely ice reflections)
-        not_too_dark = ~np.all(pixels_uint8 <= [30, 30, 30], axis=1)       # Filter out very dark (likely helmets/shadows)
+                self.team_1_color = self.potential_team_colors[darkest_idx].astype(int)  # Darker team
+                self.team_2_color = self.potential_team_colors[brightest_idx].astype(int)  # Lighter team
+                self.kmeans_initialized = True
+                print(f"Adaptive baselines established: Team 1 {self.team_1_color}, Team 2 {self.team_2_color}")
 
-        # For jersey colors, we want to keep colors that are neither too dark nor extremely bright
-        # But still include white jerseys (which can be quite bright but not as bright as ice)
-        jersey_mask = not_too_dark & not_too_bright
+            # If we have initial baselines now, use them; otherwise use brightness heuristic
+            if self.kmeans_initialized:
+                # Run K-Means with k=1 on the contour pixels to find dominant jersey color
+                if len(pixels) == 1:
+                    player_dominant_color = pixels[0].astype(int)
+                else:
+                    kmeans = KMeans(n_clusters=1, random_state=42, n_init=10)
+                    kmeans.fit(pixels)
+                    player_dominant_color = kmeans.cluster_centers_[0].astype(int)
 
-        # Additional filter to keep colors that look like jerseys
-        # Calculate brightness to distinguish from background
-        brightness = np.mean(pixels_uint8, axis=1)
-        # Keep colors that have reasonable brightness for jerseys (not too dim, not ice-bright)
-        reasonable_brightness = (brightness > 50) & (brightness < 230)
+                # Calculate distances to known baselines
+                player_lab = self.rgb_to_lab(player_dominant_color)
+                team1_lab = self.rgb_to_lab(self.team_1_color if self.team_1_color is not None else [128, 128, 128])
+                team2_lab = self.rgb_to_lab(self.team_2_color if self.team_2_color is not None else [128, 128, 128])
 
-        # Combine masks
-        valid_pixels_mask = jersey_mask & reasonable_brightness
-        valid_pixels = pixels[valid_pixels_mask]
+                dist_to_team1 = self.lab_color_distance(player_lab, team1_lab)
+                dist_to_team2 = self.lab_color_distance(player_lab, team2_lab)
 
-        if len(valid_pixels) == 0:
-            return "unknown", "unknown", (128, 128, 128)
-
-        # Step 3: Run K-Means with k=1 on remaining unmasked pixels to find the player's dominant jersey color
-        if len(valid_pixels) < 1:
-            return "unknown", "unknown", (128, 128, 128)
-
-        kmeans = KMeans(n_clusters=1, random_state=42, n_init=10)
-        kmeans.fit(valid_pixels)
-        player_dominant_color = kmeans.cluster_centers_[0].astype(int)
-
-        # Step 4: Convert both player's dominant color and team baseline colors from BGR/RGB to LAB color space
-        player_lab = self.rgb_to_lab(player_dominant_color)
-        team1_lab = self.rgb_to_lab(self.team_1_color if self.team_1_color is not None else [128, 128, 128])
-        team2_lab = self.rgb_to_lab(self.team_2_color if self.team_2_color is not None else [128, 128, 128])
-
-        # Step 5: Calculate the color distance between the player and the two baselines using LAB values
-        dist_to_team1 = self.lab_color_distance(player_lab, team1_lab)
-        dist_to_team2 = self.lab_color_distance(player_lab, team2_lab)
-
-        # Step 6: Return the assigned team (the one with the shortest distance)
-        if dist_to_team1 <= dist_to_team2:
-            return "team_1", "jersey_color_1", tuple(player_dominant_color)
+                if dist_to_team1 <= dist_to_team2:
+                    return "team_1", "jersey_color_1", tuple(player_dominant_color)
+                else:
+                    return "team_2", "t_2", tuple(player_dominant_color)
+            else:
+                # Use simple brightness heuristic when no baselines available
+                player_dominant_color = np.mean(pixels, axis=0).astype(int)
+                brightness = np.mean(player_dominant_color)
+                if brightness > 150:  # Likely white/light jersey
+                    return "team_2", "light_jersey", tuple(player_dominant_color)
+                elif brightness < 100:  # Likely black/dark jersey
+                    return "team_1", "dark_jersey", tuple(player_dominant_color)
+                else:
+                    return "unknown", "medium_jersey", tuple(player_dominant_color)
         else:
-            return "team_2", "jersey_color_2", tuple(player_dominant_color)
+            # Run K-Means with k=1 on the contour pixels to find dominant jersey color
+            if len(pixels) == 1:
+                player_dominant_color = pixels[0].astype(int)
+            else:
+                kmeans = KMeans(n_clusters=1, random_state=42, n_init=10)
+                kmeans.fit(pixels)
+                player_dominant_color = kmeans.cluster_centers_[0].astype(int)
+
+            # Convert colors from BGR/RGB to LAB color space
+            player_lab = self.rgb_to_lab(player_dominant_color)
+            team1_lab = self.rgb_to_lab(self.team_1_color if self.team_1_color is not None else [128, 128, 128])
+            team2_lab = self.rgb_to_lab(self.team_2_color if self.team_2_color is not None else [128, 128, 128])
+
+            # Calculate the color distance using LAB values
+            dist_to_team1 = self.lab_color_distance(player_lab, team1_lab)
+            dist_to_team2 = self.lab_color_distance(player_lab, team2_lab)
+
+            # Return the assigned team (shortest distance)
+            if dist_to_team1 <= dist_to_team2:
+                return "team_1", "jersey_color_1", tuple(player_dominant_color)
+            else:
+                return "team_2", "jersey_color_2", tuple(player_dominant_color)
 
     def calculate_average_color(self, frame, bbox):
         """
@@ -252,9 +375,9 @@ class TeamClassifier:
 
     def classify_player_by_color(self, frame, bbox, tracker_id):
         """
-        Classify a player based on their jersey color using K-means approach
+        Classify a player based on their jersey color using K-means approach with improved black/white detection
         """
-        # Use the new K-means based team assignment
+        # Use the new K-means based team assignment with improved extraction
         team_name, role, avg_color = self.assign_player_to_team(frame, bbox)
 
         if team_name == "unknown":
@@ -379,6 +502,12 @@ class HockeyTracker:
         self.player_trajectories = defaultdict(lambda: deque(maxlen=30))
         self.puck_trajectory = deque(maxlen=15)
 
+        # Re-ID support: store recently lost trackers {tracker_id: {'last_pos': (x,y), 'last_color': (r,g,b), 'timestamp': frame_idx}}
+        self.lost_trackers = {}
+        self.REID_PROXIMITY_THRESHOLD = 50  # Pixels
+        self.REID_COLOR_THRESHOLD = 30      # HSV distance
+        self.REID_MAX_AGE = 30              # Frames
+
         # For puck interpolation - disabling for now
         self.puck_positions_history = deque(maxlen=10)
         self.last_known_puck_position = None
@@ -437,19 +566,44 @@ class HockeyTracker:
         TEAM_ANALYSIS_FRAMES = 15
 
         # Collect frames for baseline team analysis during first few frames
-        if not self.baseline_collection_complete and self.frame_count <= self.BASELINE_COLLECTION_FRAMES:
+        if not self.baseline_collection_complete:
             self.baseline_frames_and_detections.append((frame, tracked_detections))
 
-            # If we've collected enough frames, initialize team baselines
-            if self.frame_count == self.BASELINE_COLLECTION_FRAMES:
-                # Initialize team baseline colors using K-means clustering
-                success = self.team_classifier.initialize_team_baseline_colors(self.baseline_frames_and_detections)
-                if success:
-                    print("Team baseline colors established using K-means clustering.")
-                    print(f"Team 1 color: {self.team_classifier.team_1_color}")
-                    print(f"Team 2 color: {self.team_classifier.team_2_color}")
+            # Check if we've collected enough frames OR if we have sufficient players detected
+            # Initialize team baselines when we reach the required frame count
+            if self.frame_count >= self.BASELINE_COLLECTION_FRAMES:
+                # Check if we have any player detections in our collected frames
+                has_players = any(len(detections.xyxy) > 0 for _, detections in self.baseline_frames_and_detections)
+
+                if has_players:
+                    # Initialize team baseline colors using K-means clustering
+                    success = self.team_classifier.initialize_team_baseline_colors(self.baseline_frames_and_detections)
+                    if success:
+                        print("Team baseline colors established using K-means clustering.")
+                        print(f"Team 1 color: {self.team_classifier.team_1_color}")
+                        print(f"Team 2 color: {self.team_classifier.team_2_color}")
+
+                        # Verify that both team colors were set (not None)
+                        if self.team_classifier.team_1_color is not None and self.team_classifier.team_2_color is not None:
+                            print("Both team baselines successfully established!")
+                        else:
+                            print("WARNING: One or both team baselines are None")
+                    else:
+                        print("Could not establish team baseline colors from initial frames. Using fallback.")
+
+                        # Fallback: create rough baselines based on common hockey team colors
+                        # Team 1: Darker colors (black/blue) Team 2: Lighter colors (white/red)
+                        self.team_classifier.team_1_color = np.array([40, 40, 40])  # Dark
+                        self.team_classifier.team_2_color = np.array([200, 200, 200])  # Light
+                        self.team_classifier.kmeans_initialized = True
+                        print(f"Fallback team baselines created: Team 1 {self.team_classifier.team_1_color}, Team 2 {self.team_classifier.team_2_color}")
                 else:
-                    print("Could not establish team baseline colors from initial frames.")
+                    print("No players detected in initial frames. Using fallback team colors.")
+                    # Fallback: create rough baselines based on common hockey team colors
+                    self.team_classifier.team_1_color = np.array([40, 40, 40])  # Dark
+                    self.team_classifier.team_2_color = np.array([200, 200, 200])  # Light
+                    self.team_classifier.kmeans_initialized = True
+                    print(f"Fallback team baselines created: Team 1 {self.team_classifier.team_1_color}, Team 2 {self.team_classifier.team_2_color}")
 
                 self.baseline_collection_complete = True
                 self.baseline_frames_and_detections = []  # Clear memory
@@ -610,31 +764,52 @@ class HockeyTracker:
         # Apply tracking
         tracked_detections = self.tracker.update_with_detections(detections)
 
+        # RE-ID: Detect lost trackers and add to lost_trackers
+        current_trackers = set(tracked_detections.tracker_id)
+        all_known_trackers = set(self.player_trajectories.keys()) | set(self.lost_trackers.keys())
+        newly_lost = all_known_trackers - current_trackers - set(self.jersey_numbers.keys())
+
+        for lost_id in newly_lost:
+            if lost_id in self.player_trajectories and len(self.player_trajectories[lost_id]) > 0:
+                last_pos = self.player_trajectories[lost_id][-1]
+                self.lost_trackers[lost_id] = {
+                    'last_pos': last_pos,
+                    'timestamp': self.frame_count
+                }
+
         # Handle jersey number assignment and team classification on every frame for new trackers
         self.assign_jersey_numbers(frame, tracked_detections)
 
-        # Get interpolated puck position - currently disabled
-        puck_position = None
+        # RE-ID: Check for lost trackers and attempt to re-link them if a new tracker is nearby
+        for lost_id in list(self.lost_trackers.keys()):
+            if lost_id not in current_trackers:
+                if self.frame_count - self.lost_trackers[lost_id]['timestamp'] > self.REID_MAX_AGE:
+                    del self.lost_trackers[lost_id]
 
-        # Store trajectories
         for i, (xyxy, tracker_id) in enumerate(zip(tracked_detections.xyxy, tracked_detections.tracker_id)):
-            center_point = (
-                int((xyxy[0] + xyxy[2]) / 2),
-                int((xyxy[1] + xyxy[3]) / 2)
-            )
+            center_point = (int((xyxy[0] + xyxy[2]) / 2), int((xyxy[1] + xyxy[3]) / 2))
+            if tracker_id not in self.player_trajectories or len(self.player_trajectories[tracker_id]) == 0:
+                for lost_id, data in list(self.lost_trackers.items()):
+                    last_pos = data['last_pos']
+                    dist = math.sqrt((center_point[0] - last_pos[0])**2 + (center_point[1] - last_pos[1])**2)
+                    if dist < self.REID_PROXIMITY_THRESHOLD:
+                        self.player_trajectories[tracker_id] = deque(self.player_trajectories[lost_id], maxlen=30)
+                        del self.lost_trackers[lost_id]
+                        break
 
             # Store trajectory for tracked objects (players, goaltenders, refs)
             if self.is_hockey_model:
                 if i < len(tracked_detections.class_id):
                     class_id = tracked_detections.class_id[i]
-                    # Only track players, goaltenders, and refs (classes 3, 4, 6)
                     if class_id in [3, 4, 6]:
                         self.player_trajectories[tracker_id].append(center_point)
             else:
-                # For general model, track all detections
                 self.player_trajectories[tracker_id].append(center_point)
 
-        if puck_position:
+        # Get interpolated puck position - currently disabled
+        puck_position = None
+
+        if puck_position is not None:
             self.puck_trajectory.append(puck_position)
 
         return tracked_detections, puck_position
