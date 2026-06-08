@@ -8,21 +8,27 @@ from sklearn.cluster import KMeans
 
 class TeamClassifier:
     """
-    Classifies players into teams based on dominant color analysis using K-means clustering
+    Classifies players into teams based on HSV histogram comparison
+    with periodic global re-clustering for self-correction.
     """
     def __init__(self):
         self.team_colors = {}
         self.team_avg_colors = {}  # Store average color for each team
-        self.processing_initial_analysis = True  # Flag to indicate initial team analysis phase
+        self.processing_initial_analysis = True
         self.frame_team_analysis_counter = 0
-        self.max_analysis_frames = 30  # Analyze first 30 frames to establish team colors
+        self.max_analysis_frames = 30
         self.bottom_half_only = True
         self.processing_team_assignment = True
 
-        # K-means clustering variables
-        self.team_1_color = None  # Baseline team 1 color (from k-means clustering)
-        self.team_2_color = None  # Baseline team 2 color (from k-means clustering)
-        self.kmeans_initialized = False  # Whether baseline team colors have been established
+        # Histogram-based team baselines
+        self.team_1_histogram = None  # Baseline histogram for team 1
+        self.team_2_histogram = None  # Baseline histogram for team 2
+        self.team_1_color = None  # Representative color for display
+        self.team_2_color = None
+        self.kmeans_initialized = False
+
+        # Per-player histogram storage {tracker_id: histogram}
+        self.player_histograms = {}
 
         # Variables for adaptive learning when baselines are not established
         self.potential_team_colors = []
@@ -171,109 +177,193 @@ class TeamClassifier:
 
     def initialize_team_baseline_colors(self, frames_and_detections):
         """
-        Step 2: Find Team Baselines using K-Means Clustering
-        Uses the new contour-extracted pixels. Filters removed to allow pure black/white.
+        Find Team Baselines using histogram clustering.
+        Collects per-player histograms from initial frames, clusters into 2 groups.
+        Only uses player detections (class_id 4).
         """
         from sklearn.cluster import KMeans
 
-        all_torso_pixels = []
+        player_histograms = []
 
-        # Collect jersey pixels from PLAYER detections only (class_id 4)
-        # Excludes refs, goalies, rink features which contaminate baselines
+        # Collect one histogram per player detection
         for frame, detections in frames_and_detections:
             for i, xyxy in enumerate(detections.xyxy):
-                # Filter: only use player detections (class_id == 4) if class info available
                 if detections.class_id is not None and len(detections.class_id) > i:
                     if detections.class_id[i] != 4:
                         continue
-                pixels = self.extract_jersey_contour_pixels(frame, xyxy)
-                if pixels is not None and len(pixels) > 0:
-                    # Randomly sample pixels if the contour is large to speed up KMeans
-                    if len(pixels) > 150:
-                        indices = np.random.choice(len(pixels), 150, replace=False)
-                        pixels = pixels[indices]
-                    all_torso_pixels.append(pixels)
+                hist = self.extract_jersey_histogram(frame, xyxy)
+                if hist is not None:
+                    player_histograms.append(hist)
 
-        if len(all_torso_pixels) == 0:
+        if len(player_histograms) < 2:
             return False
 
-        # Concatenate all pixels from all detections
-        all_pixels = np.vstack(all_torso_pixels)
+        # Stack histograms into a feature matrix and cluster with KMeans k=2
+        hist_matrix = np.vstack(player_histograms)
+        kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(hist_matrix)
 
-        if len(all_pixels) < 2:
+        # Compute team baseline histograms as the mean of each cluster
+        team_0_hists = hist_matrix[labels == 0]
+        team_1_hists = hist_matrix[labels == 1]
+
+        if len(team_0_hists) == 0 or len(team_1_hists) == 0:
             return False
 
-        # Apply K-means clustering with k=2 to find team baseline colors
-        n_clusters = min(2, len(all_pixels))
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        kmeans.fit(all_pixels)
+        self.team_1_histogram = np.mean(team_0_hists, axis=0).astype(np.float32)
+        self.team_2_histogram = np.mean(team_1_hists, axis=0).astype(np.float32)
 
-        # Store the two cluster centers as team baseline colors
-        cluster_centers = kmeans.cluster_centers_
+        # Also extract representative colors for display purposes
+        # Use median pixel color from the first few detections in each cluster
+        t1_colors, t2_colors = [], []
+        idx = 0
+        for frame, detections in frames_and_detections:
+            for i, xyxy in enumerate(detections.xyxy):
+                if detections.class_id is not None and len(detections.class_id) > i:
+                    if detections.class_id[i] != 4:
+                        continue
+                if idx < len(labels):
+                    pixels = self.extract_jersey_contour_pixels(frame, xyxy)
+                    if pixels is not None and len(pixels) > 0:
+                        median_color = np.median(pixels, axis=0).astype(int)
+                        if labels[idx] == 0:
+                            t1_colors.append(median_color)
+                        else:
+                            t2_colors.append(median_color)
+                    idx += 1
 
-        if len(cluster_centers) >= 1:
-            self.team_1_color = cluster_centers[0].astype(int)
-        if len(cluster_centers) >= 2:
-            self.team_2_color = cluster_centers[1].astype(int)
+        self.team_1_color = np.median(t1_colors, axis=0).astype(int) if t1_colors else np.array([40, 40, 40])
+        self.team_2_color = np.median(t2_colors, axis=0).astype(int) if t2_colors else np.array([200, 200, 200])
 
         self.kmeans_initialized = True
         return True
 
+    def extract_jersey_histogram(self, frame, bbox):
+        """
+        Extract a normalized HSV histogram from the jersey region.
+        Returns a flattened 1D feature vector, or None if extraction fails.
+        Uses 16 hue bins, 8 saturation bins, 8 value bins = 32-dim vector.
+        """
+        pixels = self.extract_jersey_contour_pixels(frame, bbox)
+        if pixels is None or len(pixels) < 5:
+            return None
+
+        # pixels are BGR float32; reshape into image-like array for cvtColor
+        pixel_img = pixels.reshape(-1, 1, 3).astype(np.uint8)
+        hsv_pixels = cv2.cvtColor(pixel_img, cv2.COLOR_BGR2HSV)
+
+        # Compute hue histogram (16 bins, range 0-180)
+        h_hist = cv2.calcHist([hsv_pixels], [0], None, [16], [0, 180])
+        # Compute saturation histogram (8 bins, range 0-256)
+        s_hist = cv2.calcHist([hsv_pixels], [1], None, [8], [0, 256])
+        # Compute value histogram (8 bins, range 0-256)
+        v_hist = cv2.calcHist([hsv_pixels], [2], None, [8], [0, 256])
+
+        # Concatenate and normalize
+        feature = np.concatenate([h_hist, s_hist, v_hist]).flatten().astype(np.float32)
+        total = feature.sum()
+        if total > 0:
+            feature /= total
+        return feature
+
+    def histogram_distance(self, hist1, hist2):
+        """
+        Distance between two histograms using Bhattacharyya distance.
+        Returns 0 (identical) to 1 (completely different).
+        """
+        if hist1 is None or hist2 is None:
+            return 1.0
+        return cv2.compareHist(
+            hist1.reshape(-1, 1),
+            hist2.reshape(-1, 1),
+            cv2.HISTCMP_BHATTACHARYYA
+        )
+
     def assign_player_to_team(self, frame, bbox):
         """
-        Step 3: Frame-by-Frame Assignment
-        Uses contour-extracted pixels to find the dominant color via median,
-        then compares to baselines using HSV distance (robust to lighting changes).
+        Assign a player to a team using histogram comparison against team baselines.
+        Returns (team_name, role, representative_color).
         """
-        # Step 1: Extract true jersey pixels using contour masking
+        hist = self.extract_jersey_histogram(frame, bbox)
         pixels = self.extract_jersey_contour_pixels(frame, bbox)
+        rep_color = tuple(np.median(pixels, axis=0).astype(int)) if pixels is not None and len(pixels) > 0 else (128, 128, 128)
 
-        if pixels is None or len(pixels) < 1:
-            return "unknown", "unknown", (128, 128, 128)
+        if hist is None:
+            return "unknown", "unknown", rep_color
 
-        # Step 2: Find dominant color using median (cheaper & more stable than KMeans k=1)
-        player_dominant_color = np.median(pixels, axis=0).astype(int)
-
-        # If baselines aren't initialized yet, use adaptive approach
-        if not self.kmeans_initialized:
-            self.potential_team_colors.append(player_dominant_color)
-
-            if len(self.potential_team_colors) >= 10:
-                brightness_values = [np.mean(color) for color in self.potential_team_colors]
-                sorted_indices = np.argsort(brightness_values)
-                darkest_idx = sorted_indices[0]
-                brightest_idx = sorted_indices[-1]
-                self.team_1_color = self.potential_team_colors[darkest_idx].astype(int)
-                self.team_2_color = self.potential_team_colors[brightest_idx].astype(int)
-                self.kmeans_initialized = True
-                print(f"Adaptive baselines established: Team 1 {self.team_1_color}, Team 2 {self.team_2_color}")
-
-            if self.kmeans_initialized:
-                # Compare using HSV distance
-                dist_to_team1 = self.hsv_color_distance(player_dominant_color, self.team_1_color if self.team_1_color is not None else np.array([128, 128, 128]))
-                dist_to_team2 = self.hsv_color_distance(player_dominant_color, self.team_2_color if self.team_2_color is not None else np.array([128, 128, 128]))
-
-                if dist_to_team1 <= dist_to_team2:
-                    return "team_1", "jersey_color_1", tuple(player_dominant_color)
-                else:
-                    return "team_2", "jersey_color_2", tuple(player_dominant_color)
+        if not self.kmeans_initialized or self.team_1_histogram is None or self.team_2_histogram is None:
+            # Baselines not ready — use brightness heuristic
+            brightness = np.mean(rep_color)
+            if brightness > 150:
+                return "team_2", "light_jersey", rep_color
+            elif brightness < 100:
+                return "team_1", "dark_jersey", rep_color
             else:
-                brightness = np.mean(player_dominant_color)
-                if brightness > 150:
-                    return "team_2", "light_jersey", tuple(player_dominant_color)
-                elif brightness < 100:
-                    return "team_1", "dark_jersey", tuple(player_dominant_color)
-                else:
-                    return "unknown", "medium_jersey", tuple(player_dominant_color)
+                return "unknown", "medium_jersey", rep_color
+
+        dist_to_team1 = self.histogram_distance(hist, self.team_1_histogram)
+        dist_to_team2 = self.histogram_distance(hist, self.team_2_histogram)
+
+        if dist_to_team1 <= dist_to_team2:
+            return "team_1", "jersey_color_1", rep_color
         else:
-            # Compare using HSV distance (robust to lighting changes)
-            dist_to_team1 = self.hsv_color_distance(player_dominant_color, self.team_1_color if self.team_1_color is not None else np.array([128, 128, 128]))
-            dist_to_team2 = self.hsv_color_distance(player_dominant_color, self.team_2_color if self.team_2_color is not None else np.array([128, 128, 128]))
+            return "team_2", "jersey_color_2", rep_color
 
-            if dist_to_team1 <= dist_to_team2:
-                return "team_1", "jersey_color_1", tuple(player_dominant_color)
+    def recluster_players(self, player_histograms_dict):
+        """
+        Global re-clustering: given {tracker_id: histogram} for all active players,
+        cluster into 2 teams and return {tracker_id: team_name}.
+        Also updates team baseline histograms.
+        """
+        from sklearn.cluster import KMeans
+
+        tracker_ids = []
+        hists = []
+        for tid, hist in player_histograms_dict.items():
+            if hist is not None:
+                tracker_ids.append(tid)
+                hists.append(hist)
+
+        if len(hists) < 2:
+            return {}  # Not enough players to cluster
+
+        hist_matrix = np.vstack(hists)
+        kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(hist_matrix)
+
+        # Update team baselines from the new clusters
+        team_0_hists = hist_matrix[labels == 0]
+        team_1_hists = hist_matrix[labels == 1]
+
+        new_t1_hist = np.mean(team_0_hists, axis=0).astype(np.float32) if len(team_0_hists) > 0 else self.team_1_histogram
+        new_t2_hist = np.mean(team_1_hists, axis=0).astype(np.float32) if len(team_1_hists) > 0 else self.team_2_histogram
+
+        # Match new clusters to existing team labels to avoid swapping team 1 <-> team 2
+        if self.team_1_histogram is not None and self.team_2_histogram is not None:
+            # Check if cluster 0 is closer to old team_1 or old team_2
+            d_00 = self.histogram_distance(new_t1_hist, self.team_1_histogram)
+            d_01 = self.histogram_distance(new_t1_hist, self.team_2_histogram)
+            if d_00 <= d_01:
+                # Cluster 0 -> team_1, Cluster 1 -> team_2 (no swap)
+                label_map = {0: 'team_1', 1: 'team_2'}
+                self.team_1_histogram = new_t1_hist
+                self.team_2_histogram = new_t2_hist
             else:
-                return "team_2", "jersey_color_2", tuple(player_dominant_color)
+                # Cluster 0 -> team_2, Cluster 1 -> team_1 (swap)
+                label_map = {0: 'team_2', 1: 'team_1'}
+                self.team_1_histogram = new_t2_hist
+                self.team_2_histogram = new_t1_hist
+        else:
+            label_map = {0: 'team_1', 1: 'team_2'}
+            self.team_1_histogram = new_t1_hist
+            self.team_2_histogram = new_t2_hist
+
+        self.kmeans_initialized = True
+
+        result = {}
+        for i, tid in enumerate(tracker_ids):
+            result[tid] = label_map[labels[i]]
+        return result
 
     def calculate_average_color(self, frame, bbox):
         """
@@ -471,14 +561,12 @@ class HockeyTracker:
         self.team_classifier = TeamClassifier()
 
         # Store previous frame team color data for voting system
-        self.team_color_buffer = {}  # {tracker_id: [(color1, frame_idx1), (color2, frame_idx2), ...]}
+        self.team_color_buffer = {}  # {tracker_id: list of (team_name, color) votes}
         self.analyzed_trackers = set()  # Trackers that have completed initial analysis
 
-        # Team validation: periodic re-check to correct wrong initial assignments
-        # Requires strong evidence (>80% disagreement) to flip — prevents lighting-induced flickering
-        self.team_validation_buffer = {}  # {tracker_id: deque of team votes}
-        self.TEAM_VALIDATION_WINDOW = 30  # Number of validation samples before considering a flip
-        self.TEAM_FLIP_THRESHOLD = 0.8    # Fraction of disagreeing votes needed to flip team
+        # Global re-clustering: every RECLUSTER_INTERVAL frames, re-cluster all active players
+        self.RECLUSTER_INTERVAL = 60  # Re-cluster every 60 frames
+        self.last_recluster_frame = 0
 
         # Initialize frame counter
         self.frame_count = 0
@@ -622,17 +710,19 @@ class HockeyTracker:
                 # Check team assignment for players (not referees/goalies for team classification)
                 if class_id == 4:  # Only for players
                     if tracker_id not in self.player_teams:
-                        # Use vote-based assignment: classify each frame, assign by majority
+                        # Use vote-based assignment with histograms
                         if tracker_id not in self.team_color_buffer:
                             self.team_color_buffer[tracker_id] = []
 
                         if self.baseline_collection_complete and self.team_classifier.kmeans_initialized:
-                            # Baselines ready: use robust contour + LAB assignment
                             team_name, role, avg_color = self.team_classifier.assign_player_to_team(frame, xyxy)
                             if team_name in ('team_1', 'team_2'):
                                 self.team_color_buffer[tracker_id].append((team_name, avg_color))
+                                # Update stored histogram for this player
+                                hist = self.team_classifier.extract_jersey_histogram(frame, xyxy)
+                                if hist is not None:
+                                    self.team_classifier.player_histograms[tracker_id] = hist
 
-                            # Assign after 5 votes via majority
                             votes = self.team_color_buffer.get(tracker_id, [])
                             if len(votes) >= 5:
                                 team_votes = [v[0] for v in votes]
@@ -645,7 +735,6 @@ class HockeyTracker:
                                 if tracker_id in self.team_color_buffer:
                                     del self.team_color_buffer[tracker_id]
                         else:
-                            # Baselines not ready: buffer raw colors and classify at end
                             avg_color = self.team_classifier.calculate_average_color(frame, xyxy)
                             if avg_color is not None:
                                 self.team_color_buffer[tracker_id].append(avg_color)
@@ -657,25 +746,11 @@ class HockeyTracker:
                                     self.analyzed_trackers.add(tracker_id)
                                     del self.team_color_buffer[tracker_id]
                     else:
-                        # Already assigned: periodic re-validation (every 5 frames)
-                        if self.frame_count % 5 == 0 and self.team_classifier.kmeans_initialized:
-                            if tracker_id not in self.team_validation_buffer:
-                                self.team_validation_buffer[tracker_id] = deque(maxlen=self.TEAM_VALIDATION_WINDOW)
-
-                            team_name, role, avg_color = self.team_classifier.assign_player_to_team(frame, xyxy)
-                            if team_name in ('team_1', 'team_2'):
-                                self.team_validation_buffer[tracker_id].append(team_name)
-
-                            # Only flip if strong evidence of wrong assignment
-                            buf = self.team_validation_buffer.get(tracker_id)
-                            if buf and len(buf) >= self.TEAM_VALIDATION_WINDOW:
-                                current_team = self.player_teams[tracker_id][0]
-                                if current_team in ('team_1', 'team_2'):
-                                    disagree_count = sum(1 for v in buf if v != current_team)
-                                    if disagree_count / len(buf) >= self.TEAM_FLIP_THRESHOLD:
-                                        other_team = 'team_2' if current_team == 'team_1' else 'team_1'
-                                        self.player_teams[tracker_id] = (other_team, self.player_teams[tracker_id][1])
-                                        buf.clear()
+                        # Already assigned: update histogram periodically for re-clustering
+                        if self.frame_count % 10 == 0:
+                            hist = self.team_classifier.extract_jersey_histogram(frame, xyxy)
+                            if hist is not None:
+                                self.team_classifier.player_histograms[tracker_id] = hist
 
                 elif class_id in [3, 6]:  # Goaltender or referee
                     # For goalies and referees, assign to special teams immediately
@@ -703,10 +778,12 @@ class HockeyTracker:
                         self.team_color_buffer[tracker_id] = []
 
                     if self.baseline_collection_complete and self.team_classifier.kmeans_initialized:
-                        # Baselines ready: vote-based assignment
                         team_name, role, avg_color = self.team_classifier.assign_player_to_team(frame, xyxy)
                         if team_name in ('team_1', 'team_2'):
                             self.team_color_buffer[tracker_id].append((team_name, avg_color))
+                            hist = self.team_classifier.extract_jersey_histogram(frame, xyxy)
+                            if hist is not None:
+                                self.team_classifier.player_histograms[tracker_id] = hist
 
                         votes = self.team_color_buffer.get(tracker_id, [])
                         if len(votes) >= 5:
@@ -720,7 +797,6 @@ class HockeyTracker:
                             if tracker_id in self.team_color_buffer:
                                 del self.team_color_buffer[tracker_id]
                     else:
-                        # Baselines not ready: buffer raw colors and classify at end
                         avg_color = self.team_classifier.calculate_average_color(frame, xyxy)
                         if avg_color is not None:
                             self.team_color_buffer[tracker_id].append(avg_color)
@@ -732,24 +808,31 @@ class HockeyTracker:
                                 self.analyzed_trackers.add(tracker_id)
                                 del self.team_color_buffer[tracker_id]
                 else:
-                    # Already assigned: periodic re-validation
-                    if self.frame_count % 5 == 0 and self.team_classifier.kmeans_initialized:
-                        if tracker_id not in self.team_validation_buffer:
-                            self.team_validation_buffer[tracker_id] = deque(maxlen=self.TEAM_VALIDATION_WINDOW)
+                    # Already assigned: update histogram periodically for re-clustering
+                    if self.frame_count % 10 == 0:
+                        hist = self.team_classifier.extract_jersey_histogram(frame, xyxy)
+                        if hist is not None:
+                            self.team_classifier.player_histograms[tracker_id] = hist
 
-                        team_name, role, avg_color = self.team_classifier.assign_player_to_team(frame, xyxy)
-                        if team_name in ('team_1', 'team_2'):
-                            self.team_validation_buffer[tracker_id].append(team_name)
+        # --- Global re-clustering every RECLUSTER_INTERVAL frames ---
+        if (self.frame_count - self.last_recluster_frame >= self.RECLUSTER_INTERVAL
+                and self.baseline_collection_complete
+                and len(self.team_classifier.player_histograms) >= 2):
+            # Only recluster players (not goalies/refs)
+            player_hists = {}
+            for tid, hist in self.team_classifier.player_histograms.items():
+                team_info = self.player_teams.get(tid)
+                if team_info and team_info[0] in ('team_1', 'team_2'):
+                    player_hists[tid] = hist
 
-                        buf = self.team_validation_buffer.get(tracker_id)
-                        if buf and len(buf) >= self.TEAM_VALIDATION_WINDOW:
-                            current_team = self.player_teams[tracker_id][0]
-                            if current_team in ('team_1', 'team_2'):
-                                disagree_count = sum(1 for v in buf if v != current_team)
-                                if disagree_count / len(buf) >= self.TEAM_FLIP_THRESHOLD:
-                                    other_team = 'team_2' if current_team == 'team_1' else 'team_1'
-                                    self.player_teams[tracker_id] = (other_team, self.player_teams[tracker_id][1])
-                                    buf.clear()
+            if len(player_hists) >= 2:
+                new_assignments = self.team_classifier.recluster_players(player_hists)
+                for tid, new_team in new_assignments.items():
+                    if tid in self.player_teams:
+                        old_team = self.player_teams[tid][0]
+                        if old_team != new_team:
+                            self.player_teams[tid] = (new_team, self.player_teams[tid][1])
+                self.last_recluster_frame = self.frame_count
 
         # Print occasional updates but not every frame
         if hasattr(self, '_last_print_frame'):
