@@ -550,8 +550,10 @@ class HockeyTracker:
         # Check if the model has the expected hockey classes
         self.is_hockey_model = self._check_if_hockey_model()
 
-        # Use ByteTrack for tracking - increase lost_track_buffer so tracks survive brief occlusions
-        self.tracker = sv.ByteTrack(lost_track_buffer=60)
+        # Use ByteTrack for tracking - tuned for hockey
+        # lost_track_buffer=60: survive brief occlusions
+        # frame_rate=30: match typical broadcast FPS for better Kalman prediction
+        self.tracker = sv.ByteTrack(lost_track_buffer=60, frame_rate=30)
 
         # Store jersey numbers for players (to be detected automatically)
         self.jersey_numbers = {}
@@ -595,6 +597,14 @@ class HockeyTracker:
         self.initialization_complete = True  # Set to True initially since assignment happens every frame
         self.initialization_frame = None
 
+        # Camera motion compensation state
+        self.prev_gray = None  # Previous frame grayscale for optical flow
+
+        # Bounding box interpolation for detection gaps
+        # {tracker_id: {'last_box': xyxy, 'last_frame': idx, 'velocity': (vx,vy)}}
+        self.last_known_boxes = {}
+        self.MAX_INTERPOLATION_GAP = 5  # Max frames to interpolate across
+
         print(f"Hockey model detection: {self.is_hockey_model}")
 
     def _check_if_hockey_model(self):
@@ -614,10 +624,16 @@ class HockeyTracker:
 
     def detect(self, frame):
         """
-        Run YOLO detection on the frame
+        Run YOLO detection on the frame with tuned parameters
         Returns detections with class information
         """
-        results = self.model(frame, verbose=False)[0]
+        results = self.model(
+            frame,
+            verbose=False,
+            conf=0.25,   # Lower confidence to catch more players
+            iou=0.4,     # Lower NMS IoU to preserve overlapping player boxes
+            imgsz=1280,  # Higher resolution for better small-player detection
+        )[0]
         detections = sv.Detections.from_ultralytics(results)
         return detections
 
@@ -855,6 +871,143 @@ class HockeyTracker:
         """
         return None  # Disabled puck tracking
 
+    def estimate_camera_motion(self, frame):
+        """
+        Estimate global camera motion between previous and current frame
+        using sparse optical flow on background keypoints.
+        Returns (dx, dy) pixel offset, or (0, 0) if estimation fails.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return (0, 0)
+
+        # Detect good features in previous frame
+        prev_pts = cv2.goodFeaturesToTrack(
+            self.prev_gray, maxCorners=200, qualityLevel=0.01, minDistance=30
+        )
+
+        if prev_pts is None or len(prev_pts) < 10:
+            self.prev_gray = gray
+            return (0, 0)
+
+        # Calculate optical flow
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, gray, prev_pts, None,
+            winSize=(21, 21), maxLevel=3
+        )
+
+        if curr_pts is None:
+            self.prev_gray = gray
+            return (0, 0)
+
+        # Filter to good matches
+        good_mask = status.flatten() == 1
+        prev_good = prev_pts[good_mask]
+        curr_good = curr_pts[good_mask]
+
+        if len(prev_good) < 6:
+            self.prev_gray = gray
+            return (0, 0)
+
+        # Compute median displacement (robust to player motion outliers)
+        displacements = curr_good - prev_good
+        dx = float(np.median(displacements[:, 0, 0]))
+        dy = float(np.median(displacements[:, 0, 1]))
+
+        self.prev_gray = gray
+        return (dx, dy)
+
+    def compensate_detections_for_camera(self, tracked_detections, dx, dy):
+        """
+        Shift the stored trajectories' last positions by camera motion
+        so that the tracker's predicted positions align with new frame coordinates.
+        This makes the Re-ID proximity check camera-motion-aware.
+        """
+        if abs(dx) < 0.5 and abs(dy) < 0.5:
+            return  # Negligible motion
+
+        # Shift last known positions of lost trackers by camera motion
+        for lost_id, data in self.lost_trackers.items():
+            old_pos = data['last_pos']
+            data['last_pos'] = (int(old_pos[0] + dx), int(old_pos[1] + dy))
+
+        # Shift last known boxes for interpolation
+        for tid, box_data in self.last_known_boxes.items():
+            box = box_data['last_box']
+            box_data['last_box'] = (
+                box[0] + dx, box[1] + dy,
+                box[2] + dx, box[3] + dy
+            )
+            # Also shift velocity isn't needed — velocity is relative to camera
+
+    def interpolate_missing_players(self, frame, tracked_detections):
+        """
+        For players that were tracked recently but are missing in current detections,
+        synthesize a bounding box using linear interpolation from last known position + velocity.
+        Returns augmented detections with interpolated boxes added.
+        """
+        current_tracker_ids = set(tracked_detections.tracker_id) if len(tracked_detections.tracker_id) > 0 else set()
+
+        # Update last known boxes for currently tracked players
+        for i, (xyxy, tracker_id) in enumerate(zip(tracked_detections.xyxy, tracked_detections.tracker_id)):
+            prev = self.last_known_boxes.get(tracker_id)
+            if prev is not None:
+                prev_box = prev['last_box']
+                # Compute velocity from box center movement
+                prev_cx = (prev_box[0] + prev_box[2]) / 2
+                prev_cy = (prev_box[1] + prev_box[3]) / 2
+                curr_cx = (xyxy[0] + xyxy[2]) / 2
+                curr_cy = (xyxy[1] + xyxy[3]) / 2
+                vx = curr_cx - prev_cx
+                vy = curr_cy - prev_cy
+            else:
+                vx, vy = 0, 0
+
+            self.last_known_boxes[tracker_id] = {
+                'last_box': tuple(xyxy),
+                'last_frame': self.frame_count,
+                'velocity': (vx, vy)
+            }
+
+        # Find players that are missing but were recently tracked
+        interp_boxes = []
+        interp_tracker_ids = []
+        interp_class_ids = []
+
+        for tid, box_data in list(self.last_known_boxes.items()):
+            if tid in current_tracker_ids:
+                continue  # Currently tracked, skip
+
+            gap = self.frame_count - box_data['last_frame']
+            if gap < 1 or gap > self.MAX_INTERPOLATION_GAP:
+                if gap > self.MAX_INTERPOLATION_GAP:
+                    del self.last_known_boxes[tid]  # Too old, clean up
+                continue
+
+            # Only interpolate players (not refs, goalies, puck etc.)
+            team_info = self.player_teams.get(tid)
+            if team_info and team_info[0] not in ('team_1', 'team_2', 'unknown'):
+                continue
+
+            # Extrapolate box position using velocity
+            box = box_data['last_box']
+            vx, vy = box_data['velocity']
+            new_box = (
+                box[0] + vx * gap,
+                box[1] + vy * gap,
+                box[2] + vx * gap,
+                box[3] + vy * gap
+            )
+
+            interp_boxes.append(new_box)
+            interp_tracker_ids.append(tid)
+            # Assume player class
+            interp_class_ids.append(4 if self.is_hockey_model else 0)
+
+        return interp_boxes, interp_tracker_ids, interp_class_ids
+
     def track(self, frame, frame_idx=0):
         """
         Process a frame with detection and tracking
@@ -862,11 +1015,22 @@ class HockeyTracker:
         # Increment frame counter for voting system
         self.frame_count += 1
 
+        # Estimate and compensate for camera motion
+        dx, dy = self.estimate_camera_motion(frame)
+        self.compensate_detections_for_camera(None, dx, dy)
+
         # Run detection
         detections = self.detect(frame)
 
         # Apply tracking
         tracked_detections = self.tracker.update_with_detections(detections)
+
+        # Interpolate missing players and update trajectories for them
+        interp_boxes, interp_tids, interp_cids = self.interpolate_missing_players(frame, tracked_detections)
+        for ibox, itid, icid in zip(interp_boxes, interp_tids, interp_cids):
+            # Add interpolated position to trajectory so visualization still shows them
+            center = (int((ibox[0] + ibox[2]) / 2), int((ibox[1] + ibox[3]) / 2))
+            self.player_trajectories[itid].append(center)
 
         # RE-ID: Detect lost trackers and add to lost_trackers (with appearance info)
         current_trackers = set(tracked_detections.tracker_id)
